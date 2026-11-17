@@ -8,9 +8,10 @@ import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
+import psycopg
 from pydantic import BaseModel, Field
 
-from . import backuper, config, recoverer, source, state
+from . import backuper, config, recoverer, retest, source, state
 from .walutil import lsn_to_int
 
 _stop = threading.Event()
@@ -23,7 +24,9 @@ DESCRIPTION = """
 * 恢复：基准备份 + 归档 WAL 重放到核对点（pause → 校验位点 → promote），
   产出**独立只读**实例；跨点后才提交的事务不会出现；
 * 查询：只打恢复实例，绝不用当前源库冒充恢复结果；
-* 一次只恢复一项；失败或重启后可按原核对点重试。
+* 一次只恢复一项；失败或重启后可按原核对点重试；
+* 复测核定：两次平行 pH 同事务登记/核定，超差只待复核，版本递增、
+  幂等重试，源库改值或删除后旧核定自动失效（`/api/retests`）。
 """
 
 
@@ -41,6 +44,16 @@ class RecoveryIn(BaseModel):
 class QueryIn(BaseModel):
     sql: str = Field(examples=["SELECT * FROM samples ORDER BY id"],
                      description="单条只读 SELECT 语句")
+
+
+class RetestIn(BaseModel):
+    sample_no: str = Field(examples=["S-2026-0001"], description="样品号")
+    sample_row_id: int = Field(ge=1, examples=[1], description="样品行 ID（samples.id）")
+    version: int = Field(ge=1, examples=[1], description="递增核定版本（旧版本不得覆盖）")
+    ph_reading_a: float = Field(ge=0, le=14, examples=[7.12],
+                                description="第一次平行检测 pH 读数")
+    ph_reading_b: float = Field(ge=0, le=14, examples=[7.20],
+                                description="第二次平行检测 pH 读数")
 
 
 # ------------------------------------------------------------------ 生命周期
@@ -79,6 +92,10 @@ async def lifespan(_app: FastAPI):
               os.path.dirname(config.STATE_DB) or "."):
         os.makedirs(d, exist_ok=True)
     state.init_db()
+    try:
+        retest.ensure_schema()  # 幂等建表/加列，老容器卷自动升级
+    except Exception as e:  # noqa: BLE001 - 源库暂不可用时不阻断 PITR 服务启动
+        print(f"[retest] schema 初始化失败（稍后可重试）: {e}")
     recoverer.resume_after_restart()
     threading.Thread(target=_refresher_loop, name="refresher", daemon=True).start()
     threading.Thread(target=recoverer.dispatch_loop, args=(_stop,),
@@ -137,7 +154,7 @@ def _ensure_no_active_job() -> None:
 def root():
     return {"service": "水质数仓 PITR 恢复服务", "docs": "/docs",
             "api": ["/api/health", "/api/basebackup", "/api/checkpoints",
-                    "/api/recoveries"]}
+                    "/api/recoveries", "/api/retests"]}
 
 
 @app.get("/api/health", summary="健康检查")
@@ -266,6 +283,52 @@ def cancel_recovery(job_id: int):
         state.update_job(job_id, status="stopped", detail="实例已停止")
         return state.one_row("SELECT * FROM jobs WHERE id=?", (job_id,))
     return job
+
+
+# ------------------------------------------------------------------ 复测核定
+
+@app.post("/api/retests", tags=["retest"],
+          summary="提交两次平行检测的复测核定（同事务写入生产样品）")
+def submit_retest(body: RetestIn):
+    try:
+        return retest.submit_retest(
+            sample_no=body.sample_no,
+            sample_row_id=body.sample_row_id,
+            version=body.version,
+            reading_a=body.ph_reading_a,
+            reading_b=body.ph_reading_b,
+        )
+    except retest.RetestError as e:
+        raise HTTPException(e.code, str(e))
+    except psycopg.errors.UndefinedTable:
+        # 启动时源库不可用导致建表失败：首次调用时补建一次后重试
+        try:
+            retest.ensure_schema()
+            return retest.submit_retest(
+                sample_no=body.sample_no, sample_row_id=body.sample_row_id,
+                version=body.version, reading_a=body.ph_reading_a,
+                reading_b=body.ph_reading_b)
+        except retest.RetestError as e2:
+            raise HTTPException(e2.code, str(e2))
+        except Exception as e2:  # noqa: BLE001
+            raise HTTPException(502, f"复测核定写入失败: {e2}")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"复测核定写入失败: {e}")
+
+
+@app.get("/api/retests", tags=["retest"],
+         summary="查询当前样品复测结论（按样品号或样品行 ID）")
+def get_retest(sample_no: str | None = Query(None, description="样品号"),
+               sample_row_id: int | None = Query(None, ge=1, description="样品行 ID")):
+    try:
+        return retest.get_retest_conclusion(sample_no, sample_row_id)
+    except retest.RetestError as e:
+        raise HTTPException(e.code, str(e))
+    except psycopg.errors.UndefinedTable:
+        retest.ensure_schema()
+        return retest.get_retest_conclusion(sample_no, sample_row_id)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"复测结论查询失败: {e}")
 
 
 # ------------------------------------------------------------------ 目标查询

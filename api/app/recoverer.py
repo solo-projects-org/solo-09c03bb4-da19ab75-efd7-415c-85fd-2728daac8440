@@ -370,7 +370,11 @@ def _query_conn() -> psycopg.Connection:
 
 def fetch_samples(station_no: str | None, sample_no: str | None,
                   limit: int) -> list[dict]:
-    sql = ("SELECT id, sample_no, station_no, ph::float8 AS ph, created_at"
+    # 核定 pH 与两次原始读数随 samples 同行恢复，核对点后提交的复测不会提前出现
+    sql = ("SELECT id, sample_no, station_no, ph::float8 AS ph,"
+           "       retest_version, ph_reading_a::float8 AS ph_reading_a,"
+           "       ph_reading_b::float8 AS ph_reading_b,"
+           "       approved_ph::float8 AS approved_ph, created_at"
            " FROM public.samples")
     where, params = [], []
     if station_no:
